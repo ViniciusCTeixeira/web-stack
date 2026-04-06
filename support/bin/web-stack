@@ -1,0 +1,1336 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+LIB_FILE="/usr/local/lib/web-stack.sh"
+
+load_lib() {
+  if [[ ! -f "${LIB_FILE}" ]]; then
+    echo "Biblioteca nao encontrada: ${LIB_FILE}" >&2
+    exit 1
+  fi
+
+  # shellcheck disable=SC1091
+  . "${LIB_FILE}"
+}
+
+require_root() {
+  if [[ "${EUID}" -ne 0 ]]; then
+    echo "Use sudo para este comando." >&2
+    exit 1
+  fi
+}
+
+error() {
+  echo "❌ Erro: $*" >&2
+  exit 1
+}
+
+warn() {
+  echo "⚠️  Aviso: $*" >&2
+}
+
+success() {
+  echo "✓ $*"
+}
+
+info() {
+  echo "ℹ️  $*"
+}
+
+check_dependencies() {
+  local missing=0
+
+  if ! command -v docker >/dev/null 2>&1; then
+    warn "Docker não está instalado"
+    echo "   Execute: sudo apt-get install docker.io" >&2
+    missing=1
+  fi
+
+  if command -v docker >/dev/null 2>&1 && ! docker ps >/dev/null 2>&1; then
+    warn "Docker daemon não está rodando"
+    echo "   Execute: sudo systemctl start docker" >&2
+    missing=1
+  fi
+
+  if ! command -v docker-compose >/dev/null 2>&1 && ! docker compose version >/dev/null 2>&1; then
+    warn "Docker Compose não encontrado"
+    missing=1
+  fi
+
+  if [[ ! -f "/etc/web-stack.conf" ]]; then
+    error "Arquivo de configuração não encontrado: /etc/web-stack.conf"
+  fi
+
+  if [[ $missing -eq 1 ]]; then
+    error "Dependências não encontradas. Verifique os avisos acima."
+  fi
+}
+
+main_help() {
+  cat <<'EOT'
+Uso:
+  web-stack <categoria> <acao> [opcoes]
+
+Categorias:
+  docker       gerencia containers, compose, versoes PHP, MySQL e Redis
+  vhost        cria, edita e remove VirtualHosts
+  localhost    altera a versao PHP usada no localhost
+  composer     executa Composer dentro do container PHP escolhido
+  on           ativa recurso(s) (all, php, php74, php83, php84, mysql, redis)
+  off          desativa recurso(s) (all, php, php74, php83, php84, mysql, redis)
+  list         lista status detalhado de todos os recursos
+  status       mostra status resumido (-v para verbose)
+  logs         mostra logs de containers (mysql, php74-84, redis, all)
+  shell        acesso bash/shell ao container
+  restart      reinicia recurso(s)
+  exec         executa comando no container
+  stats        mostra uso de CPU/Memória
+  cleanup      remove containers/volumes/images não utilizados
+  backup       cria backup de MySQL e Redis
+  restore      restaura backup
+
+Exemplos - Controle de Recursos:
+  web-stack on all                    ativa tudo
+  web-stack off all                   desativa tudo
+  web-stack on php84                  ativa só PHP 8.4
+  web-stack on php83                  ativa só PHP 8.3
+  web-stack off php74                 desativa só PHP 7.4
+  web-stack on php                    ativa todas as versões PHP
+
+Exemplos - Status e Logs:
+  web-stack status                    mostra status resumido
+  web-stack status -v                 mostra status detalhado
+  web-stack list                      lista detalhada de recursos
+  web-stack logs mysql                mostra logs do MySQL
+  web-stack logs php84                mostra logs do PHP 8.4
+  web-stack logs php84 -f             segue logs em tempo real
+  web-stack logs all                  mostra logs de tudo
+  web-stack stats                     mostra CPU/Memória dos containers
+
+Exemplos - Acesso aos Containers:
+  web-stack shell php84               entra no bash do PHP 8.4
+  web-stack shell mysql               entra no mysql client
+  web-stack shell redis               entra no redis-cli
+  web-stack exec php84 php -v         executa comando PHP
+  web-stack exec php84 composer install
+  web-stack exec mysql mysql -u root -p123 -e "SHOW DATABASES"
+
+Exemplos - Reiniciar:
+  web-stack restart mysql             reinicia MySQL
+  web-stack restart php84             reinicia PHP 8.4
+  web-stack restart all               reinicia tudo
+
+Exemplos - Manutenção:
+  web-stack cleanup                   remove containers parados
+  web-stack cleanup --volumes         remove containers e volumes
+  web-stack cleanup --all             remove tudo
+  web-stack backup                    cria backup (MySQL + Redis)
+  web-stack restore backup_2024-04-05.tar.gz
+
+Exemplos - Docker:
+  web-stack docker up                 sobe containers
+  web-stack docker down               desce containers
+  web-stack docker build              faz build das imagens
+  web-stack docker rebuild            rebuild completo
+  web-stack docker list-versions      lista versões PHP
+  sudo web-stack docker version add 82 8.2-fpm
+  sudo web-stack docker version edit 84 8.4.2-fpm
+
+Exemplos - Composer:
+  web-stack composer 84 install       instala dependencies
+  web-stack composer 84 require vendor/package
+  web-stack composer 74 --version     verifica versão do Composer
+
+Exemplos - VirtualHost:
+  sudo web-stack vhost create crm.test crm 84
+  sudo web-stack vhost create --ssl crm.test crm 84 public
+  sudo web-stack vhost create --ssl --redirect-http crm.test crm 84 public
+  sudo web-stack vhost edit --ssl crm.test crm 84
+  sudo web-stack vhost remove crm.test
+
+Exemplos - Localhost:
+  sudo web-stack localhost version 83
+  sudo web-stack localhost version 84
+
+Dicas:
+  web-stack -h                      mostra esta ajuda
+  web-stack <categoria> -h          mostra ajuda da categoria
+EOT
+}
+
+docker_help() {
+  cat <<'EOT'
+Uso:
+  web-stack docker <acao>
+
+Acoes:
+  up                                  sobe containers
+  down                                desce containers
+  build                               faz build das imagens
+  rebuild                             rebuild completo (sem cache)
+  refresh-compose                     regenera docker-compose.yml
+  list-versions                       lista versões PHP configuradas
+  version add versao imagem [porta]   adiciona nova versão PHP
+  version edit versao imagem [porta]  edita versão PHP existente
+  version remove versao               remove versão PHP
+
+Exemplos - Iniciar/Parar:
+  web-stack docker up                 sobe todos os containers
+  web-stack docker down               desce todos os containers
+  web-stack docker build              faz build das imagens
+  web-stack docker rebuild            rebuild completo (sem cache)
+  web-stack docker refresh-compose    regenera docker-compose.yml
+
+Exemplos - Versões PHP:
+  web-stack docker list-versions      mostra versões disponíveis
+  sudo web-stack docker version add 82 8.2-fpm
+  sudo web-stack docker version add 82 8.2-fpm 9182
+  sudo web-stack docker version edit 84 8.4.2-fpm
+  sudo web-stack docker version edit 84 8.4.2-fpm 9084
+  sudo web-stack docker version remove 82
+
+Observacoes:
+  - MySQL e Redis sobem junto com PHP
+  - MySQL: localhost:3306
+  - Redis: localhost:6379
+  - Cada versão PHP tem sua porta (9074, 9083, 9084, etc)
+EOT
+}
+
+composer_help() {
+  cat <<'EOT'
+Uso:
+  web-stack composer <versao> [comando]
+
+Versoes:
+  74, 83, 84                          versões PHP disponíveis
+
+Exemplos - Informações:
+  web-stack composer 84 --version     verifica versão do Composer
+  web-stack composer 84 show          lista packages instalados
+  web-stack composer 84 show -D       lista dependencies diretas
+  web-stack composer 84 diagnose      diagnóstico do Composer
+
+Exemplos - Instalar/Atualizar:
+  web-stack composer 84 install       instala dependencies (composer.lock)
+  web-stack composer 84 update        atualiza todas as dependencies
+  web-stack composer 84 update vendor/package
+  web-stack composer 84 require vendor/package
+  web-stack composer 84 require --dev phpunit/phpunit
+
+Exemplos - Remover/Limpar:
+  web-stack composer 84 remove vendor/package
+  web-stack composer 84 remove --dev vendor/package
+  web-stack composer 84 dumpautoload -o
+
+Exemplos - Scripts:
+  web-stack composer 84 run-script   lista scripts disponíveis
+  web-stack composer 84 run-script test
+  web-stack composer 84 run-script build
+
+Exemplos - Com Diferentes Versões:
+  web-stack composer 74 install      instala em PHP 7.4
+  web-stack composer 83 install      instala em PHP 8.3
+  web-stack composer 84 install      instala em PHP 8.4
+
+Dicas:
+  - Roda no diretório atual (~/Projects/PHP)
+  - Se estiver em subdiretório, roda lá
+  - COMPOSER_ALLOW_SUPERUSER=1 automático
+EOT
+}
+
+localhost_help() {
+  cat <<'EOT'
+Uso:
+  sudo web-stack localhost version <versao>
+
+Versoes Disponíveis:
+  74                                  PHP 7.4.33
+  83                                  PHP 8.3.14
+  84                                  PHP 8.4 (padrão)
+
+Exemplos - Mudar Versão:
+  sudo web-stack localhost version 74 muda para PHP 7.4
+  sudo web-stack localhost version 83 muda para PHP 8.3
+  sudo web-stack localhost version 84 muda para PHP 8.4
+
+Acesso:
+  http://localhost               acesso HTTP
+  https://localhost              acesso HTTPS
+
+Diretório:
+  ~/Projects/PHP                DocumentRoot do localhost
+  ~/Projects/PHP/index.php       arquivo principal
+  ~/Projects/PHP/phpinfo.php     teste de informações
+
+Observacoes:
+  - Requer privilégios sudo
+  - Muda a porta do localhost
+  - Reinicia Apache automaticamente
+  - Dados persistem no container
+EOT
+}
+
+vhost_help() {
+  cat <<'EOT'
+Uso:
+  sudo web-stack vhost <acao> [opcoes]
+
+Acoes:
+  create [opts]  dominio pasta versao [raiz|public|webroot]
+  edit [opts]    dominio pasta versao [raiz|public|webroot]
+  remove         dominio [--keep-hosts]
+
+Opcoes:
+  --ssl                               ativa HTTPS/SSL
+  --redirect-http                     redireciona HTTP para HTTPS
+
+Raiz de Projeto:
+  raiz                                ~/Projects/PHP/pasta
+  public                              ~/Projects/PHP/pasta/public
+  webroot                             ~/Projects/PHP/pasta/webroot
+
+Exemplos - Criar VirtualHost HTTP:
+  sudo web-stack vhost create crm.test crm 84
+  sudo web-stack vhost create site.test site 83
+  sudo web-stack vhost create api.test api 84
+
+Exemplos - Criar VirtualHost HTTPS:
+  sudo web-stack vhost create --ssl crm.test crm 84
+  sudo web-stack vhost create --ssl site.test site 83 public
+  sudo web-stack vhost create --ssl api.test api 84 webroot
+
+Exemplos - HTTPS com Redirect HTTP:
+  sudo web-stack vhost create --ssl --redirect-http crm.test crm 84
+  sudo web-stack vhost create --ssl --redirect-http site.test site 84 public
+  sudo web-stack vhost create --ssl --redirect-http api.test api 84 webroot
+
+Exemplos - Editar VirtualHost:
+  sudo web-stack vhost edit crm.test crm 83
+  sudo web-stack vhost edit --ssl site.test site 84 public
+  sudo web-stack vhost edit --ssl --redirect-http api.test api 84
+
+Exemplos - Remover VirtualHost:
+  sudo web-stack vhost remove crm.test
+  sudo web-stack vhost remove site.test --keep-hosts
+  sudo web-stack vhost remove api.test
+
+Acesso:
+  http://crm.test                     HTTP
+  https://crm.test                    HTTPS (auto-certificado)
+
+Observacoes:
+  - Requer privilégios sudo
+  - Adiciona entrada em /etc/hosts
+  - Gera certificado SSL automático
+  - Reinicia Apache após mudanças
+  - Suporta .htaccess
+EOT
+}
+
+update_vhost_ports_for_version() {
+  local version="$1"
+  local port="$2"
+  local changed=0
+  local file
+
+  for file in /etc/apache2/sites-available/*.conf; do
+    [[ -f "${file}" ]] || continue
+    if grep -q "^# php-local-env:php_version=${version}$" "${file}"; then
+      sed -i -E "s/# php-local-env:php_port=.*/# php-local-env:php_port=${port}/" "${file}"
+      sed -i -E "s#SetHandler \"proxy:fcgi://127\\.0\\.0\\.1:[0-9]+\"#SetHandler \"proxy:fcgi://127.0.0.1:${port}\"#" "${file}"
+      changed=1
+    fi
+  done
+
+  if [[ "${changed}" == "1" ]]; then
+    apache2ctl configtest
+    systemctl reload apache2
+  fi
+}
+
+check_vhost_references_for_version() {
+  local version="$1"
+  local refs
+  refs="$(grep -l "^# php-local-env:php_version=${version}$" /etc/apache2/sites-available/*.conf 2>/dev/null || true)"
+  if [[ -n "${refs}" ]]; then
+    echo "A versao ${version} ainda esta em uso por VirtualHosts:" >&2
+    echo "${refs}" >&2
+    exit 1
+  fi
+}
+
+docker_version_add() {
+  require_root
+  local version="${1:-}"
+  local image_tag="${2:-}"
+  local port="${3:-}"
+
+  if [[ -z "${version}" || -z "${image_tag}" ]]; then
+    docker_help
+    exit 1
+  fi
+
+  if [[ ! "${version}" =~ ^[0-9]{2}$ ]]; then
+    echo "Versao invalida. Use dois digitos, por exemplo 74, 82, 83 ou 84."
+    exit 1
+  fi
+
+  load_lib
+  load_php_env
+
+  if version_exists "${version}"; then
+    echo "A versao ${version} ja existe."
+    exit 1
+  fi
+
+  if [[ -z "${port}" ]]; then
+    port="90${version}"
+  fi
+
+  if ! [[ "${port}" =~ ^[0-9]{4,5}$ ]]; then
+    echo "Porta invalida: ${port}"
+    exit 1
+  fi
+
+  if awk -F'|' -v port="${port}" '$3 == port { found=1 } END { exit found ? 0 : 1 }' "${VERSIONS_FILE}"; then
+    echo "A porta ${port} ja esta em uso."
+    exit 1
+  fi
+
+  echo "${version}|${image_tag}|${port}" >> "${VERSIONS_FILE}"
+  write_php_runtime_files "${DOCKER_ROOT}/php${version}" "${version}" "${image_tag}"
+  render_compose_from_registry
+  chown -R "${TARGET_USER}:${TARGET_USER}" "${DOCKER_ROOT}/php${version}" "${VERSIONS_FILE}" "${COMPOSE_FILE}"
+
+  cd "${DOCKER_ROOT}"
+  docker compose build "php${version}"
+  docker compose up -d "php${version}"
+
+  echo "Nova versao PHP criada com sucesso:"
+  echo "- Servico: php${version}"
+  echo "- Imagem base: php:${image_tag}"
+  echo "- Porta: ${port}"
+}
+
+docker_version_edit() {
+  require_root
+  local version="${1:-}"
+  local image_tag="${2:-}"
+  local port="${3:-}"
+
+  if [[ -z "${version}" || -z "${image_tag}" ]]; then
+    docker_help
+    exit 1
+  fi
+
+  if [[ ! "${version}" =~ ^[0-9]{2}$ ]]; then
+    echo "Versao invalida. Use dois digitos, por exemplo 74, 82, 83 ou 84."
+    exit 1
+  fi
+
+  load_lib
+  load_php_env
+  require_version_exists "${version}"
+
+  local current_port
+  current_port="$(get_version_port "${version}")"
+  if [[ -z "${port}" ]]; then
+    port="${current_port}"
+  fi
+
+  if ! [[ "${port}" =~ ^[0-9]{4,5}$ ]]; then
+    echo "Porta invalida: ${port}"
+    exit 1
+  fi
+
+  if awk -F'|' -v version="${version}" -v port="${port}" '$1 != version && $3 == port { found=1 } END { exit found ? 0 : 1 }' "${VERSIONS_FILE}"; then
+    echo "A porta ${port} ja esta em uso por outra versao."
+    exit 1
+  fi
+
+  local tmp_file
+  tmp_file="$(mktemp)"
+  awk -F'|' -v version="${version}" -v image="${image_tag}" -v port="${port}" '
+    $1 == version { print version "|" image "|" port; next }
+    { print $0 }
+  ' "${VERSIONS_FILE}" > "${tmp_file}"
+  mv "${tmp_file}" "${VERSIONS_FILE}"
+
+  write_php_runtime_files "${DOCKER_ROOT}/php${version}" "${version}" "${image_tag}"
+  render_compose_from_registry
+  chown -R "${TARGET_USER}:${TARGET_USER}" "${DOCKER_ROOT}/php${version}" "${VERSIONS_FILE}" "${COMPOSE_FILE}"
+
+  cd "${DOCKER_ROOT}"
+  docker compose up -d --build --force-recreate "php${version}"
+  update_vhost_ports_for_version "${version}" "${port}"
+
+  echo "Versao PHP atualizada com sucesso:"
+  echo "- Servico: php${version}"
+  echo "- Imagem base: php:${image_tag}"
+  echo "- Porta: ${port}"
+}
+
+docker_version_remove() {
+  require_root
+  local version="${1:-}"
+
+  if [[ -z "${version}" ]]; then
+    docker_help
+    exit 1
+  fi
+
+  if [[ ! "${version}" =~ ^[0-9]{2}$ ]]; then
+    echo "Versao invalida. Use dois digitos, por exemplo 74, 82, 83 ou 84."
+    exit 1
+  fi
+
+  load_lib
+  load_php_env
+  require_version_exists "${version}"
+
+  if [[ "${DEFAULT_PHP_VERSION}" == "${version}" ]]; then
+    echo "Nao remova a versao padrao do localhost (${version}) sem antes trocar o padrao com 'web-stack localhost version'."
+    exit 1
+  fi
+
+  check_vhost_references_for_version "${version}"
+
+  local versions_left
+  versions_left="$(awk -F'|' -v version="${version}" '$1 != version && NF { count++ } END { print count+0 }' "${VERSIONS_FILE}")"
+  if [[ "${versions_left}" -eq 0 ]]; then
+    echo "Nao e permitido remover a ultima versao registrada."
+    exit 1
+  fi
+
+  cd "${DOCKER_ROOT}"
+  docker compose stop "php${version}" >/dev/null 2>&1 || true
+  docker compose rm -f "php${version}" >/dev/null 2>&1 || true
+
+  local tmp_file
+  tmp_file="$(mktemp)"
+  awk -F'|' -v version="${version}" '$1 != version { print $0 }' "${VERSIONS_FILE}" > "${tmp_file}"
+  mv "${tmp_file}" "${VERSIONS_FILE}"
+
+  local target_dir="${DOCKER_ROOT}/php${version}"
+  if [[ -d "${target_dir}" ]]; then
+    rm -rf -- "${target_dir}"
+  fi
+
+  render_compose_from_registry
+  chown -R "${TARGET_USER}:${TARGET_USER}" "${VERSIONS_FILE}" "${COMPOSE_FILE}"
+
+  echo "Versao PHP removida com sucesso:"
+  echo "- Servico: php${version}"
+  echo "- Diretorio removido: ${target_dir}"
+}
+
+docker_cmd() {
+  local action="${1:-}"
+  case "${action}" in
+    ""|-h|--help)
+      docker_help
+      ;;
+    up)
+      load_lib
+      load_php_env
+      render_compose_from_registry
+      cd "${DOCKER_ROOT}"
+      docker compose up -d
+      ;;
+    down)
+      load_lib
+      load_php_env
+      cd "${DOCKER_ROOT}"
+      docker compose down
+      ;;
+    build)
+      load_lib
+      load_php_env
+      render_compose_from_registry
+      cd "${DOCKER_ROOT}"
+      docker compose build
+      ;;
+    rebuild)
+      load_lib
+      load_php_env
+      render_compose_from_registry
+      cd "${DOCKER_ROOT}"
+      docker compose down
+      docker compose build --no-cache
+      docker compose up -d
+      ;;
+    refresh-compose)
+      load_lib
+      load_php_env
+      render_compose_from_registry
+      echo "docker-compose.yml atualizado em ${COMPOSE_FILE}."
+      ;;
+    list-versions)
+      load_lib
+      load_php_env
+      printf "%-8s %-18s %-8s\n" "VERSAO" "IMAGEM" "PORTA"
+      while IFS='|' read -r version image_tag port; do
+        [[ -z "${version}" ]] && continue
+        printf "%-8s %-18s %-8s\n" "${version}" "${image_tag}" "${port}"
+      done < "${VERSIONS_FILE}"
+      ;;
+    version)
+      case "${2:-}" in
+        add) docker_version_add "${@:3}" ;;
+        edit) docker_version_edit "${@:3}" ;;
+        remove) docker_version_remove "${@:3}" ;;
+        *) docker_help; exit 1 ;;
+      esac
+      ;;
+    *)
+      docker_help
+      exit 1
+      ;;
+  esac
+}
+
+composer_cmd() {
+  local version="${1:-}"
+  if [[ -z "${version}" || "${version}" == "-h" || "${version}" == "--help" ]]; then
+    composer_help
+    exit 0
+  fi
+  shift || true
+
+  load_lib
+  load_php_env
+  require_version_exists "${version}"
+
+  local service="php${version}"
+  local host_pwd workdir
+  host_pwd="$(pwd -P)"
+  workdir="${PHP_ROOT}"
+
+  if [[ "${host_pwd}" == "${PHP_ROOT}" || "${host_pwd}" == "${PHP_ROOT}/"* ]]; then
+    workdir="${host_pwd}"
+  fi
+
+  cd "${DOCKER_ROOT}"
+
+  if docker compose ps --status running -q "${service}" >/dev/null 2>&1 && [[ -n "$(docker compose ps --status running -q "${service}")" ]]; then
+    docker compose exec -e COMPOSER_ALLOW_SUPERUSER=1 -w "${workdir}" "${service}" composer "$@"
+  else
+    docker compose run --rm -e COMPOSER_ALLOW_SUPERUSER=1 -w "${workdir}" "${service}" composer "$@"
+  fi
+}
+
+localhost_cmd() {
+  if [[ "${1:-}" == "-h" || "${1:-}" == "--help" || -z "${1:-}" ]]; then
+    localhost_help
+    exit 0
+  fi
+
+  require_root
+  local action="${1:-}"
+  local version="${2:-}"
+
+  if [[ "${action}" != "version" || -z "${version}" ]]; then
+    localhost_help
+    exit 1
+  fi
+
+  load_lib
+  load_php_env
+  require_version_exists "${version}"
+
+  local port
+  port="$(get_version_port "${version}")"
+
+  if [[ ! -f "${LOCALHOST_SSL_VHOST}" ]]; then
+    echo "Arquivo nao encontrado: ${LOCALHOST_SSL_VHOST}"
+    exit 1
+  fi
+
+  if [[ -f "${LOCALHOST_HTTP_VHOST}" ]] && grep -q 'SetHandler "proxy:fcgi://127.0.0.1:' "${LOCALHOST_HTTP_VHOST}"; then
+    sed -i -E "s/# php-local-env:php_version=.*/# php-local-env:php_version=${version}/" "${LOCALHOST_HTTP_VHOST}"
+    sed -i -E "s/# php-local-env:php_port=.*/# php-local-env:php_port=${port}/" "${LOCALHOST_HTTP_VHOST}"
+    sed -i -E "s#SetHandler \"proxy:fcgi://127\\.0\\.0\\.1:[0-9]+\"#SetHandler \"proxy:fcgi://127.0.0.1:${port}\"#" "${LOCALHOST_HTTP_VHOST}"
+  fi
+
+  sed -i -E "s/# php-local-env:php_version=.*/# php-local-env:php_version=${version}/" "${LOCALHOST_SSL_VHOST}"
+  sed -i -E "s/# php-local-env:php_port=.*/# php-local-env:php_port=${port}/" "${LOCALHOST_SSL_VHOST}"
+  sed -i -E "s#SetHandler \"proxy:fcgi://127\\.0\\.0\\.1:[0-9]+\"#SetHandler \"proxy:fcgi://127.0.0.1:${port}\"#" "${LOCALHOST_SSL_VHOST}"
+  apache2ctl configtest
+  systemctl reload apache2
+  set_default_php_version "${version}"
+
+  echo "localhost agora usa PHP ${version}."
+}
+
+render_http_vhost() {
+  local file="$1"
+  local domain="$2"
+  local docroot="$3"
+  local version="$4"
+  local port="$5"
+
+  cat > "${file}" <<VHOST
+<VirtualHost *:80>
+    ServerName ${domain}
+    ServerAdmin dev@local
+
+    # Managed by php-local-env
+    # php-local-env:docroot=${docroot}
+    # php-local-env:php_version=${version}
+    # php-local-env:php_port=${port}
+    # php-local-env:http_redirect=0
+
+    DocumentRoot ${docroot}
+
+    <Directory ${docroot}>
+        AllowOverride All
+        Require all granted
+        Options FollowSymLinks Indexes
+        DirectoryIndex index.php index.html
+    </Directory>
+
+    ProxyTimeout 300
+
+    <FilesMatch \.php$>
+        SetHandler "proxy:fcgi://127.0.0.1:${port}"
+    </FilesMatch>
+
+    ErrorLog \${APACHE_LOG_DIR}/${domain}_error.log
+    CustomLog \${APACHE_LOG_DIR}/${domain}_access.log combined
+</VirtualHost>
+VHOST
+}
+
+render_http_redirect_vhost() {
+  local file="$1"
+  local domain="$2"
+  cat > "${file}" <<VHOST
+<VirtualHost *:80>
+    ServerName ${domain}
+    Redirect permanent / https://${domain}/
+</VirtualHost>
+VHOST
+}
+
+render_https_vhost() {
+  local file="$1"
+  local domain="$2"
+  local docroot="$3"
+  local version="$4"
+  local port="$5"
+  local redirect="$6"
+  local crt="$7"
+  local key="$8"
+
+  cat > "${file}" <<VHOST
+<VirtualHost *:443>
+    ServerName ${domain}
+    ServerAdmin dev@local
+
+    # Managed by php-local-env
+    # php-local-env:docroot=${docroot}
+    # php-local-env:php_version=${version}
+    # php-local-env:php_port=${port}
+    # php-local-env:http_redirect=${redirect}
+
+    DocumentRoot ${docroot}
+
+    <Directory ${docroot}>
+        AllowOverride All
+        Require all granted
+        Options FollowSymLinks Indexes
+        DirectoryIndex index.php index.html
+    </Directory>
+
+    ProxyTimeout 300
+
+    SSLEngine on
+    SSLCertificateFile ${crt}
+    SSLCertificateKeyFile ${key}
+
+    <FilesMatch \.php$>
+        SetHandler "proxy:fcgi://127.0.0.1:${port}"
+    </FilesMatch>
+
+    ErrorLog \${APACHE_LOG_DIR}/${domain}_ssl_error.log
+    CustomLog \${APACHE_LOG_DIR}/${domain}_ssl_access.log combined
+</VirtualHost>
+VHOST
+}
+
+resolve_docroot() {
+  local rel_path="$1"
+  local mode="$2"
+  case "${mode}" in
+    public) printf '%s\n' "${PHP_ROOT}/${rel_path}/public" ;;
+    webroot) printf '%s\n' "${PHP_ROOT}/${rel_path}/webroot" ;;
+    raiz) printf '%s\n' "${PHP_ROOT}/${rel_path}" ;;
+    *) return 1 ;;
+  esac
+}
+
+vhost_upsert() {
+  local operation="$1"
+  shift
+
+  local use_ssl=0
+  local redirect_http=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --ssl)
+        use_ssl=1
+        shift
+        ;;
+      --redirect-http)
+        redirect_http=1
+        shift
+        ;;
+      -h|--help)
+        vhost_help
+        exit 0
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+
+  require_root
+
+  local domain="${1:-}"
+  local rel_path="${2:-}"
+  local version="${3:-}"
+  local mode="${4:-raiz}"
+
+  if [[ -z "${domain}" || -z "${rel_path}" || -z "${version}" ]]; then
+    vhost_help
+    exit 1
+  fi
+
+  load_lib
+  load_php_env
+  require_version_exists "${version}"
+
+  local port docroot
+  port="$(get_version_port "${version}")"
+  if ! docroot="$(resolve_docroot "${rel_path}" "${mode}")"; then
+    echo "Modo de docroot invalido. Use raiz, public ou webroot."
+    exit 1
+  fi
+
+  local http_vhost="/etc/apache2/sites-available/${domain}.conf"
+  local https_vhost="/etc/apache2/sites-available/${domain}-ssl.conf"
+
+  if [[ "${use_ssl}" == "1" ]]; then
+    local crt="${CERTS_DIR}/${domain}.crt"
+    local key="${CERTS_DIR}/${domain}.key"
+    generate_local_cert "${domain}" "${crt}" "${key}"
+
+    if [[ "${redirect_http}" == "1" ]]; then
+      render_http_redirect_vhost "${http_vhost}" "${domain}"
+    else
+      render_http_vhost "${http_vhost}" "${domain}" "${docroot}" "${version}" "${port}"
+    fi
+    render_https_vhost "${https_vhost}" "${domain}" "${docroot}" "${version}" "${port}" "${redirect_http}" "${crt}" "${key}"
+    a2ensite "${domain}-ssl.conf" >/dev/null
+  else
+    render_http_vhost "${http_vhost}" "${domain}" "${docroot}" "${version}" "${port}"
+    if [[ -f "${https_vhost}" ]]; then
+      a2dissite "${domain}-ssl.conf" >/dev/null 2>&1 || true
+      rm -f "${https_vhost}"
+    fi
+  fi
+
+  a2ensite "${domain}.conf" >/dev/null
+  apache2ctl configtest
+  systemctl reload apache2
+  ensure_hosts_entry "${domain}"
+
+  echo "VirtualHost ${operation}:"
+  echo "- Dominio: ${domain}"
+  echo "- Projeto: ${PHP_ROOT}/${rel_path}"
+  echo "- Docroot: ${docroot}"
+  echo "- PHP: ${version} (porta ${port})"
+  echo "- SSL: ${use_ssl}"
+  echo "- Redirect HTTP: ${redirect_http}"
+}
+
+vhost_remove() {
+  require_root
+  local domain="${1:-}"
+  local keep_hosts=0
+
+  shift || true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --keep-hosts) keep_hosts=1 ;;
+      -h|--help) vhost_help; exit 0 ;;
+      *) echo "Argumento invalido: $1"; exit 1 ;;
+    esac
+    shift
+  done
+
+  if [[ -z "${domain}" ]]; then
+    vhost_help
+    exit 1
+  fi
+
+  local http_vhost="/etc/apache2/sites-available/${domain}.conf"
+  local https_vhost="/etc/apache2/sites-available/${domain}-ssl.conf"
+  local changed=0
+
+  if [[ -f "${http_vhost}" ]]; then
+    a2dissite "${domain}.conf" >/dev/null 2>&1 || true
+    rm -f "${http_vhost}"
+    changed=1
+  fi
+
+  if [[ -f "${https_vhost}" ]]; then
+    a2dissite "${domain}-ssl.conf" >/dev/null 2>&1 || true
+    rm -f "${https_vhost}"
+    changed=1
+  fi
+
+  if [[ "${changed}" == "0" ]]; then
+    echo "Nenhum VirtualHost encontrado para ${domain}."
+    exit 1
+  fi
+
+  apache2ctl configtest
+  systemctl reload apache2
+
+  if [[ "${keep_hosts}" == "0" ]]; then
+    local tmp_hosts
+    tmp_hosts="$(mktemp)"
+    awk -v domain="${domain}" '!(NF == 2 && $1 == "127.0.0.1" && $2 == domain)' /etc/hosts > "${tmp_hosts}"
+    cat "${tmp_hosts}" > /etc/hosts
+    rm -f "${tmp_hosts}"
+  fi
+
+  echo "VirtualHost removido:"
+  echo "- Dominio: ${domain}"
+  echo "- Removido do hosts: $((1 - keep_hosts))"
+}
+
+vhost_cmd() {
+  local action="${1:-}"
+  case "${action}" in
+    ""|-h|--help)
+      vhost_help
+      ;;
+    create)
+      vhost_upsert "criado" "${@:2}"
+      ;;
+    edit)
+      vhost_upsert "atualizado" "${@:2}"
+      ;;
+    remove)
+      vhost_remove "${@:2}"
+      ;;
+    *)
+      vhost_help
+      exit 1
+      ;;
+  esac
+}
+
+get_container_status() {
+  local container="$1"
+  if docker ps --filter "name=${container}" --format "{{.Names}}" | grep -q "^${container}$"; then
+    echo "ativo"
+  elif docker ps -a --filter "name=${container}" --format "{{.Names}}" | grep -q "^${container}$"; then
+    echo "parado"
+  else
+    echo "nao_existe"
+  fi
+}
+
+list_resources() {
+  load_lib
+  load_php_env
+
+  echo
+  echo "=== Status dos Recursos web-stack ==="
+  echo
+
+  # MySQL
+  local mysql_status
+  mysql_status="$(get_container_status "php-env-mysql")"
+  printf "%-15s %-15s\n" "MySQL:" "$([[ "$mysql_status" == "ativo" ]] && echo "✓ ATIVO" || echo "✗ INATIVO")"
+
+  # Redis
+  local redis_status
+  redis_status="$(get_container_status "php-env-redis")"
+  printf "%-15s %-15s\n" "Redis:" "$([[ "$redis_status" == "ativo" ]] && echo "✓ ATIVO" || echo "✗ INATIVO")"
+
+  # PHP Versions
+  echo
+  echo "Versões PHP:"
+  printf "  %-12s %-15s %-8s\n" "VERSAO" "STATUS" "PORTA"
+  while IFS='|' read -r version image_tag port; do
+    [[ -z "${version}" ]] && continue
+    local container_name="php${version}-fpm"
+    local status
+    status="$(get_container_status "$container_name")"
+    printf "  %-12s %-15s %-8s\n" "PHP $version" "$([[ "$status" == "ativo" ]] && echo "✓ ATIVO" || echo "✗ INATIVO")" "$port"
+  done < "${VERSIONS_FILE}"
+
+  echo
+}
+
+on_resource() {
+  local resource="${1:-}"
+
+  if [[ -z "${resource}" ]]; then
+    error "Especifique um recurso: all, php, php74, php83, php84, mysql, redis"
+  fi
+
+  load_lib
+  load_php_env
+
+  case "${resource}" in
+    all)
+      info "Ativando todos os recursos..."
+      cd "${DOCKER_ROOT}"
+      docker compose up -d
+      success "Todos os recursos foram ativados"
+      ;;
+    php)
+      info "Ativando PHP..."
+      cd "${DOCKER_ROOT}"
+      local php_services=()
+      while IFS='|' read -r version image_tag port; do
+        [[ -z "${version}" ]] && continue
+        php_services+=("php${version}")
+      done < "${VERSIONS_FILE}"
+
+      if [[ ${#php_services[@]} -gt 0 ]]; then
+        docker compose up -d "${php_services[@]}"
+        success "PHP foi ativado (versões: ${php_services[*]})"
+      else
+        error "Nenhuma versão PHP configurada"
+      fi
+      ;;
+    php7*|php8*)
+      local version="${resource:3}"
+      info "Ativando PHP ${version}..."
+      cd "${DOCKER_ROOT}"
+      docker compose up -d "php${version}"
+      success "PHP ${version} foi ativado"
+      ;;
+    mysql)
+      info "Ativando MySQL..."
+      cd "${DOCKER_ROOT}"
+      docker compose up -d mysql
+      success "MySQL foi ativado"
+      ;;
+    redis)
+      info "Ativando Redis..."
+      cd "${DOCKER_ROOT}"
+      docker compose up -d redis
+      success "Redis foi ativado"
+      ;;
+    *)
+      error "Recurso inválido: $resource. Use: all, php, php74, php83, php84, mysql, redis"
+      ;;
+  esac
+}
+
+off_resource() {
+  local resource="${1:-}"
+
+  if [[ -z "${resource}" ]]; then
+    error "Especifique um recurso: all, php, php74, php83, php84, mysql, redis"
+  fi
+
+  load_lib
+  load_php_env
+
+  case "${resource}" in
+    all)
+      info "Desativando todos os recursos..."
+      cd "${DOCKER_ROOT}"
+      docker compose down
+      success "Todos os recursos foram desativados"
+      ;;
+    php)
+      info "Desativando PHP..."
+      cd "${DOCKER_ROOT}"
+      local php_services=()
+      while IFS='|' read -r version image_tag port; do
+        [[ -z "${version}" ]] && continue
+        php_services+=("php${version}")
+      done < "${VERSIONS_FILE}"
+
+      if [[ ${#php_services[@]} -gt 0 ]]; then
+        docker compose stop "${php_services[@]}" >/dev/null 2>&1 || true
+        success "PHP foi desativado (versões: ${php_services[*]})"
+      else
+        error "Nenhuma versão PHP configurada"
+      fi
+      ;;
+    php7*|php8*)
+      local version="${resource:3}"
+      info "Desativando PHP ${version}..."
+      cd "${DOCKER_ROOT}"
+      docker compose stop "php${version}" >/dev/null 2>&1 || true
+      success "PHP ${version} foi desativado"
+      ;;
+    mysql)
+      info "Desativando MySQL..."
+      cd "${DOCKER_ROOT}"
+      docker compose stop mysql >/dev/null 2>&1 || true
+      success "MySQL foi desativado"
+      ;;
+    redis)
+      info "Desativando Redis..."
+      cd "${DOCKER_ROOT}"
+      docker compose stop redis >/dev/null 2>&1 || true
+      success "Redis foi desativado"
+      ;;
+    *)
+      error "Recurso inválido: $resource. Use: all, php, php74, php83, php84, mysql, redis"
+      ;;
+  esac
+}
+
+logs_cmd() {
+  local container="${1:-all}"
+  local follow=0
+  shift || true
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -f|--follow) follow=1; shift ;;
+      *) shift ;;
+    esac
+  done
+
+  load_lib
+  load_php_env
+  cd "${DOCKER_ROOT}"
+
+  local follow_flag=""
+  [[ $follow -eq 1 ]] && follow_flag="-f"
+
+  case "${container}" in
+    mysql) docker compose logs $follow_flag mysql ;;
+    redis) docker compose logs $follow_flag redis ;;
+    php74|php83|php84) docker compose logs $follow_flag "${container}-fpm" ;;
+    php) docker compose logs $follow_flag php74-fpm php83-fpm php84-fpm ;;
+    all) docker compose logs $follow_flag ;;
+    *) error "Container não encontrado: $container" ;;
+  esac
+}
+
+shell_cmd() {
+  local container="${1:-}"
+
+  [[ -z "${container}" ]] && error "Especifique: php74, php83, php84, mysql, redis"
+
+  load_lib
+  load_php_env
+  cd "${DOCKER_ROOT}"
+
+  case "${container}" in
+    php74|php83|php84)
+      docker compose exec "${container}-fpm" bash
+      ;;
+    mysql)
+      docker compose exec mysql bash
+      ;;
+    redis)
+      docker compose exec redis redis-cli
+      ;;
+    *) error "Container não encontrado: $container" ;;
+  esac
+}
+
+restart_cmd() {
+  local resource="${1:-all}"
+  info "Reiniciando $resource..."
+  off_resource "$resource" >/dev/null 2>&1 || true
+  sleep 2
+  on_resource "$resource"
+}
+
+status_cmd() {
+  local verbose=0
+  [[ "${1:-}" == "-v" || "${1:-}" == "--verbose" ]] && verbose=1
+
+  if [[ $verbose -eq 1 ]]; then
+    list_resources
+  else
+    load_lib
+    load_php_env
+    echo
+    info "=== Status web-stack ==="
+    local mysql_status=$(get_container_status "php-env-mysql" 2>/dev/null || echo "nao_existe")
+    local redis_status=$(get_container_status "php-env-redis" 2>/dev/null || echo "nao_existe")
+    echo "MySQL: $([[ "$mysql_status" == "ativo" ]] && echo "✓" || echo "✗") | Redis: $([[ "$redis_status" == "ativo" ]] && echo "✓" || echo "✗")"
+    echo
+  fi
+}
+
+exec_cmd() {
+  local container="${1:-}"
+  shift || true
+  [[ -z "${container}" ]] && error "Especifique: php74, php83, php84, mysql, redis"
+  [[ $# -eq 0 ]] && error "Especifique um comando"
+
+  load_lib
+  load_php_env
+  cd "${DOCKER_ROOT}"
+
+  case "${container}" in
+    php74|php83|php84)
+      docker compose exec "${container}-fpm" "$@"
+      ;;
+    mysql|redis)
+      docker compose exec "$container" "$@"
+      ;;
+    *) error "Container não encontrado" ;;
+  esac
+}
+
+stats_cmd() {
+  load_lib
+  load_php_env
+  cd "${DOCKER_ROOT}"
+  info "Estatísticas de uso (CPU/Memória):"
+  docker compose stats
+}
+
+cleanup_cmd() {
+  local all=0
+  local volumes=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --all) all=1; shift ;;
+      --volumes) volumes=1; shift ;;
+      *) shift ;;
+    esac
+  done
+
+  load_lib
+  load_php_env
+  cd "${DOCKER_ROOT}"
+
+  if [[ $all -eq 1 ]]; then
+    docker compose down -v --remove-orphans
+    success "Containers, volumes e networks removidos"
+  elif [[ $volumes -eq 1 ]]; then
+    docker compose down -v
+    success "Containers e volumes removidos"
+  else
+    docker compose down --remove-orphans
+    success "Containers removidos"
+  fi
+}
+
+backup_cmd() {
+  load_lib
+  load_php_env
+
+  local backup_dir="${DOCKER_ROOT}/backups"
+  mkdir -p "${backup_dir}"
+  local timestamp=$(date +%Y-%m-%d_%H-%M-%S)
+  local backup_file="${backup_dir}/backup_${timestamp}.tar.gz"
+
+  cd "${DOCKER_ROOT}"
+  info "Criando backup (MySQL + Redis)..."
+
+  local temp_backup=$(mktemp -d)
+  docker compose exec -T mysql mysqldump -u root -p"${MYSQL_ROOT_PASSWORD}" --all-databases > "${temp_backup}/mysql.sql" 2>/dev/null || true
+  docker compose exec -T redis redis-cli BGSAVE >/dev/null 2>&1
+  sleep 1
+  docker compose exec redis cat /data/dump.rdb > "${temp_backup}/redis.rdb" 2>/dev/null || true
+  tar -czf "${backup_file}" -C "${temp_backup}" . 2>/dev/null || true
+  rm -rf "${temp_backup}"
+
+  if [[ -f "${backup_file}" ]]; then
+    success "Backup: $(du -h "$backup_file" | cut -f1) em $backup_file"
+  fi
+}
+
+restore_cmd() {
+  local backup_file="${1:-}"
+  [[ -z "${backup_file}" ]] && error "Use: web-stack restore <arquivo>"
+  [[ ! -f "${backup_file}" ]] && error "Arquivo não encontrado"
+
+  load_lib
+  load_php_env
+
+  info "Restaurando backup..."
+  local temp_restore=$(mktemp -d)
+  tar -xzf "${backup_file}" -C "${temp_restore}"
+  cd "${DOCKER_ROOT}"
+
+  [[ -f "${temp_restore}/mysql.sql" ]] && docker compose exec -T mysql mysql -u root -p"${MYSQL_ROOT_PASSWORD}" < "${temp_restore}/mysql.sql" 2>/dev/null || true
+  [[ -f "${temp_restore}/redis.rdb" ]] && docker compose exec -T redis bash -c "cat > /data/dump.rdb" < "${temp_restore}/redis.rdb" && docker compose restart redis >/dev/null 2>&1
+
+  rm -rf "${temp_restore}"
+  success "Restore concluído"
+}
+
+case "${1:-}" in
+  ""|-h|--help)
+    main_help
+    ;;
+  docker)
+    docker_cmd "${@:2}"
+    ;;
+  composer)
+    composer_cmd "${@:2}"
+    ;;
+  localhost)
+    localhost_cmd "${@:2}"
+    ;;
+  vhost)
+    vhost_cmd "${@:2}"
+    ;;
+  list)
+    list_resources
+    ;;
+  status)
+    status_cmd "${@:2}"
+    ;;
+  logs)
+    logs_cmd "${@:2}"
+    ;;
+  shell)
+    shell_cmd "${@:2}"
+    ;;
+  restart)
+    restart_cmd "${@:2}"
+    ;;
+  exec)
+    exec_cmd "${@:2}"
+    ;;
+  stats)
+    stats_cmd
+    ;;
+  cleanup)
+    cleanup_cmd "${@:2}"
+    ;;
+  backup)
+    backup_cmd "${@:2}"
+    ;;
+  restore)
+    restore_cmd "${@:2}"
+    ;;
+  on)
+    on_resource "${2:-}"
+    ;;
+  off)
+    off_resource "${2:-}"
+    ;;
+  *)
+    main_help
+    exit 1
+    ;;
+esac
+
